@@ -1,0 +1,18 @@
+=== dinov2 / full | устройство cuda | train 1754 val 377 test 375
+[baseline] recall_at_1=0.8027  recall_at_5=0.9573  accuracy=0.8320  macro_f1=0.7986
+fine-tune: учим 43.0M параметров backbone, батч 16, эпох 15, шагов/эпоху 109
+эпоха  1  loss 10.724  val R@1 0.8037  val F1 0.7898  118 c
+эпоха  2  loss 8.186  val R@1 0.8302  val F1 0.7959  118 c
+эпоха  3  loss 6.463  val R@1 0.7878  val F1 0.7928  118 c
+эпоха  4  loss 5.619  val R@1 0.8329  val F1 0.8063  118 c
+эпоха  5  loss 5.247  val R@1 0.8249  val F1 0.8168  118 c
+эпоха  6  loss 4.460  val R@1 0.8462  val F1 0.8223  118 c
+эпоха  7  loss 3.735  val R@1 0.8143  val F1 0.8120  118 c
+эпоха  8  loss 3.660  val R@1 0.8435  val F1 0.8113  118 c
+эпоха  9  loss 3.128  val R@1 0.8382  val F1 0.8130  118 c
+эпоха 10  loss 2.457  val R@1 0.8382  val F1 0.8184  118 c
+эпоха 11  loss 2.317  val R@1 0.8276  val F1 0.8318  118 c
+ранняя остановка: 5 эпох без улучшения
+лучшая эпоха 6
+[finetuned] recall_at_1=0.8213  recall_at_5=0.9333  accuracy=0.8400  macro_f1=0.8108
+готово за 23.3 мин -> results/dinov2_full

@@ -1,0 +1,594 @@
+"""Демо: чертёж (PDF / PNG / JPG) -> данные со штампа -> класс -> топ-5 аналогов из базы или «новый класс».
+
+Запуск:
+    python demo.py --model best.pt --gallery gallery.npz --data <папка с params.csv и png_views> \
+                   --out report.html  чертёж1.pdf чертёж2.png ...
+
+Порядок работы (геометрия первична, текст вторичен):
+  1. Лист -> растр; находим рамку по ГОСТ 2.104, убираем штамп, доп. графу, ТТ, знак шероховатости.
+  2. Оставшееся поле видов -> так же, как при обучении (обрезка, квадрат x1.1, 512x512) -> DINOv2 -> эмбеддинг.
+  3. kNN по базе: класс = взвешенное голосование top-5; сходство top-1 ниже порога -> «аналог не найден».
+  4. Текст: PDF — из текстового слоя по ячейкам штампа; растр — OCR (Tesseract rus), если установлен.
+  5. Пересортировка top-10 с небольшим весом по материалу и массе (не перебивает геометрию).
+"""
+import argparse, base64, os, html, io, math, re, shutil, sys, time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from scipy import ndimage
+
+HERE = Path(__file__).resolve().parent
+for _p in (HERE, HERE.parent / "train"):   # плоская папка или структура репозитория
+    sys.path.insert(0, str(_p))
+from train import Net, CFG   # noqa: E402
+
+try:
+    from ultralytics import YOLO
+    HAS_YOLO = True
+except ImportError:
+    HAS_YOLO = False
+
+DPI = 100                      # как в генераторе обучающих картинок (matplotlib, 100 dpi)
+PXMM = DPI / 25.4
+FORMATS = {"A4": (210, 297), "A3": (420, 297), "A3p": (297, 420), "A2": (594, 420), "A1": (841, 594)}
+
+
+# ======================================================================= лист -> поле видов
+def load_sheet(path):
+    """Возвращает (RGB-массив при ~100 dpi, список слов PDF в мм или None, размер листа в мм или None)."""
+    path = Path(path)
+    if path.suffix.lower() == ".pdf":
+        import pymupdf
+        doc = pymupdf.open(str(path)); page = doc[0]
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(DPI / 72, DPI / 72), alpha=False)
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[..., :3].copy()
+        k = 25.4 / 72
+        words = [(w[0] * k, w[1] * k, w[2] * k, w[3] * k, w[4]) for w in page.get_text("words")]
+        return img, words, (page.rect.width * k, page.rect.height * k)
+    im = Image.open(path)
+    if im.mode in ("RGBA", "LA", "P"):
+        bg = Image.new("RGB", im.size, "white"); im = im.convert("RGBA"); bg.paste(im, mask=im.split()[-1]); im = bg
+    return np.asarray(im.convert("RGB")).copy(), None, None
+
+
+def long_runs(mask, axis):
+    """Длина самого длинного непрерывного отрезка «чернил» в каждой строке (axis=1) или столбце (axis=0)."""
+    m = mask if axis == 1 else mask.T
+    best = np.zeros(m.shape[0], int)
+    for i, row in enumerate(m):
+        if not row.any(): continue
+        d = np.diff(np.r_[0, row.astype(np.int8), 0]); s, e = np.where(d == 1)[0], np.where(d == -1)[0]
+        best[i] = (e - s).max()
+    return best
+
+
+def find_frame(gray):
+    """Внутренняя рамка листа: крайние линии длиной > 60% листа (тонкие и прерывистые линии тоже)."""
+    H, W = gray.shape
+    ink = gray < 235
+    hz = ndimage.binary_closing(ink, structure=np.ones((1, 7)))
+    vt = ndimage.binary_closing(ink, structure=np.ones((7, 1)))
+    rows = np.where(long_runs(hz, 1) > 0.6 * W)[0]; cols = np.where(long_runs(vt, 0) > 0.6 * H)[0]
+    rows = rows[(rows > 0.01 * H) & (rows < 0.99 * H)]; cols = cols[(cols > 0.01 * W) & (cols < 0.99 * W)]
+    if len(rows) < 2 or len(cols) < 2:
+        return None
+    return int(cols.min()), int(rows.min()), int(cols.max()), int(rows.max())
+
+
+def stamp_scale(gray, fr):
+    """Масштаб пикс/мм по основной надписи: её верхняя линия длиной 185 мм на высоте 55 мм от рамки."""
+    x0, y0, x1, y1 = fr
+    hz = ndimage.binary_closing(gray < 235, structure=np.ones((1, 5)))
+    for y in range(int(y0 + 0.4 * (y1 - y0)), int(y1 - 5)):
+        row = hz[y, x0:x1 - 1][::-1]
+        L = int(np.argmin(row)) if not row.all() else len(row)    # длина отрезка, примыкающего к правой рамке
+        if L < 0.2 * (x1 - x0): continue
+        r = L / max(1, (y1 - y))
+        if 3.0 <= r <= 3.75:
+            return L / 185.0
+    return None
+
+
+def ocr_words(gray, up=1.0):
+    """Слова, найденные Tesseract на листе: [(x0, y0, x1, y1, текст, уверенность)] в пикселях входной картинки."""
+    if not shutil.which("tesseract"):
+        return None
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        im = Image.fromarray(gray.astype(np.uint8))
+        if up != 1: im = im.resize((round(im.width * up), round(im.height * up)), Image.LANCZOS)
+        im.save(f.name)
+        out = subprocess.run(["tesseract", f.name, "-", "-l", "rus+eng", "--psm", "11", "tsv"],
+                             capture_output=True, text=True).stdout
+    res = []
+    for line in out.splitlines()[1:]:
+        c = line.split("\t")
+        if len(c) < 12 or not c[11].strip(): continue
+        l, t, w, h, conf = int(c[6]), int(c[7]), int(c[8]), int(c[9]), float(c[10])
+        res.append((l / up, t / up, (l + w) / up, (t + h) / up, c[11].strip(), conf))
+    return res
+
+
+def is_wordy(t):
+    return len(re.findall(r"[A-Za-zА-Яа-яЁё]", t)) >= 3 and not re.fullmatch(r"[MМ]\d.*", t)
+
+
+def text_like_blocks(ink, x0, x1, y_bottom, y_top, s):
+    """Без OCR: идём вверх от штампа, подряд идущие строки текста (ТТ) -> маска. s = пикс/мм."""
+    region = ink[y_top:y_bottom, x0:x1]
+    prof = region.any(1)
+    masks = []; y = len(prof) - 1; gap = 0
+    while y > 0:
+        if not prof[y]:
+            gap += 1
+            if (gap > 10 * s and masks) or gap > 25 * s: break
+            y -= 1; continue
+        gap = 0; e = y
+        while y > 0 and prof[y]: y -= 1
+        blk = region[y:e + 1]
+        lab, n = ndimage.label(blk)
+        if n == 0: continue
+        tall = max(sl[0].stop - sl[0].start for sl in ndimage.find_objects(lab)) / s
+        if (e - y) / s <= 7 and tall <= 6 and n >= 3:
+            masks.append((y_top + y, y_top + e + 1))
+        else:
+            break
+    return masks
+
+
+
+def yolo_views_image(img, yolo_model, words=None, sheet_mm=None, conf=0.35):
+    """Детекция структуры листа через обученную нейросеть YOLO (ООО БВК / ЮУрГУ).
+    Находит поле видов (views_field), штамп (stamp 185x55) и ТТ (tech_req).
+    """
+    im_pil = Image.fromarray(img) if isinstance(img, np.ndarray) else img
+    W, H = im_pil.size
+    results = yolo_model.predict(source=im_pil, conf=conf, verbose=False)[0]
+
+    names = results.names
+    boxes_by_class = {}
+    for box in results.boxes:
+        cls_name = names[int(box.cls[0])]
+        boxes_by_class.setdefault(cls_name, []).append((float(box.conf[0]), [round(v, 1) for v in box.xyxy[0].tolist()]))
+
+    stamp_box = max(boxes_by_class.get("stamp", []), key=lambda x: x[0], default=None)
+    views_box = max(boxes_by_class.get("views_field", []), key=lambda x: x[0], default=None)
+
+    if stamp_box is None and views_box is None and "view_front" not in boxes_by_class:
+        return None
+
+    # Масштаб в пикселях на мм по ширине штампа 185 мм (ГОСТ 2.104)
+    if stamp_box:
+        sx1, sy1, sx2, sy2 = stamp_box[1]
+        s = (sx2 - sx1) / 185.0
+        frame = (int(max(0, sx1 - 5 * s)), int(max(0, sy1 - 5 * s)), int(sx2), int(sy2))
+    elif sheet_mm:
+        s = H / sheet_mm[1]
+        frame = (int(20 * s), int(5 * s), int(W - 5 * s), int(H - 5 * s))
+    else:
+        s = PXMM
+        frame = (0, 0, W, H)
+
+    # Поле видов
+    if views_box:
+        vx1, vy1, vx2, vy2 = [int(round(v)) for v in views_box[1]]
+        crop = im_pil.crop((max(0, vx1), max(0, vy1), min(W, vx2), min(H, vy2)))
+    elif "view_front" in boxes_by_class:
+        all_v = [b[1] for cls_k in ("view_front", "view_top", "view_left") for b in boxes_by_class.get(cls_k, [])]
+        vx1 = min(b[0] for b in all_v); vy1 = min(b[1] for b in all_v)
+        vx2 = max(b[2] for b in all_v); vy2 = max(b[3] for b in all_v)
+        crop = im_pil.crop((max(0, int(vx1)), max(0, int(vy1)), min(W, int(vx2)), min(H, int(vy2))))
+    else:
+        crop = im_pil
+
+    cw, ch = crop.size
+    side = int(max(cw, ch) * 1.05)
+    canvas = Image.new("RGB", (side, side), (255, 255, 255))
+    canvas.paste(crop, ((side - cw) // 2, (side - ch) // 2))
+    views_512 = canvas.resize((512, 512), Image.Resampling.LANCZOS)
+
+    dbg = Image.fromarray(results.plot())
+    cap_note = "Лист. Детекция структуры ЕСКД через обученную YOLO (штамп 185х55, поле видов, ТТ)."
+    return views_512, dbg, s, frame, None, cap_note
+
+def views_image(img, words=None, sheet_mm=None, text_ok=False, ocr_src=None):
+    """ocr_src: (серый лист в высоком разрешении, во сколько раз он больше img) — для OCR мелкого текста."""
+    """Возвращает (512x512 как при обучении, отладочная картинка, пикс/мм, рамка, слова OCR)."""
+    gray = img.min(axis=2).astype(np.float32)            # цветные линии КОМПАС (синие/оранжевые) -> чёрные
+    ink = gray < 200
+    H, W = ink.shape
+    fr = find_frame(gray)
+    if fr is None:
+        x0, y0, x1, y1 = 0, 0, W - 1, H - 1; s = PXMM; framed = False
+    else:
+        x0, y0, x1, y1 = fr; framed = True
+        s = stamp_scale(gray, fr) or ((y1 - y0) / (sheet_mm[1] - 10) if sheet_mm else (y1 - y0) / 287)
+    m = max(2, int(round(1.2 * s)))
+    keep = np.zeros_like(ink); keep[y0 + m:y1 - m, x0 + m:x1 - m] = True
+    boxes = []
+    if framed:
+        boxes.append((x1 - 185 * s - m, y1 - 55 * s - m, x1, y1))                  # основная надпись
+        boxes.append((x1 - 45 * s, y0, x1, y0 + 13 * s))                          # знак шероховатости
+    # доп. графа 70x14 мм у верхнего левого угла (горизонтальная или повёрнутая): ищем её длинную сторону
+    if framed:
+        dark = gray < 235
+        for xx in range(int(x0 + 10 * s), int(x0 + 19 * s)):                    # вертикальная графа 14x70
+            col = dark[int(y0 + m):int(y0 + 66 * s), max(0, xx - 1):xx + 2].any(1)
+            if col.mean() > 0.97:
+                boxes.append((x0, y0, xx + m, y0 + 72 * s)); break
+        for yy in range(int(y0 + 10 * s), int(y0 + 19 * s)):                    # горизонтальная графа 70x14
+            row = dark[max(0, yy - 1):yy + 2, int(x0 + m):int(x0 + 66 * s)].any(0)
+            if row.mean() > 0.97:
+                boxes.append((x0, y0, x0 + 72 * s, yy + m)); break
+    # текст: из текстового слоя PDF (если читается), иначе OCR. Слова (>=3 букв) убираем — при обучении их не было
+    if words and text_ok:
+        toks = [(w[0] * PXMM, w[1] * PXMM, w[2] * PXMM, w[3] * PXMM, w[4], 100.0) for w in words]
+        owords = None
+    else:
+        if ocr_src is not None:
+            hi, f = ocr_src
+            owords = ocr_words(hi, 1.0)
+            owords = None if owords is None else [(w[0] / f, w[1] / f, w[2] / f, w[3] / f, w[4], w[5]) for w in owords]
+        else:
+            owords = ocr_words(gray, 2.0 if gray.shape[1] < 2000 else 1.0)
+        toks = owords or []
+        if owords is None and framed:                                           # без OCR: строки текста над штампом
+            for a_, b_ in text_like_blocks(ink, int(x1 - 185 * s), int(x1), int(y1 - 55 * s - m), int(y0 + m), s):
+                boxes.append((x1 - 185 * s, a_ - m, x1, b_ + m))
+    for w in toks:
+        if w[5] > 40 and is_wordy(w[4]):
+            boxes.append((w[0] - m, w[1] - m, w[2] + m, w[3] + m))
+    # блок технических требований: от заголовка вниз, пока строки идут подряд (шаг <= 7 мм)
+    for h in [w for w in toks if w[4].lower().startswith(("техническ", "техннческ"))]:
+        hx0, ht, hb = h[0], h[1], h[3]; xr = h[2]
+        for w in sorted(toks, key=lambda z: z[1]):
+            if w[1] > ht and w[1] <= hb + 7 * s and hx0 - 3 * s <= w[0] <= hx0 + 185 * s and w[1] < y1 - 2 * s:
+                if framed and w[0] > x1 - 185 * s - m and w[1] > y1 - 55 * s - m: continue   # это уже штамп
+                hb = max(hb, w[3]); xr = max(xr, w[2])
+        boxes.append((hx0 - m, ht - m, xr + m, hb + m))
+    for bx0, by0, bx1, by1 in boxes:
+        keep[max(0, int(by0)):int(by1) + 1, max(0, int(bx0)):int(bx1) + 1] = False
+    v = ink & keep
+    lab, n = ndimage.label(v, structure=np.ones((3, 3)))                           # убрать одиночные точки
+    if n:
+        sz = ndimage.sum(v, lab, range(1, n + 1)); v &= np.isin(lab, 1 + np.where(sz >= 4)[0])
+    ys, xs = np.where(v)
+    if len(ys) == 0:
+        raise ValueError("на листе не найдено изображение")
+    crop = np.where(v, gray, 255)[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    k = PXMM / s                                     # к масштабу обучения (~100 dpi)
+    if abs(k - 1) > 0.05:
+        cim = Image.fromarray(crop.astype(np.uint8))
+        crop = np.asarray(cim.resize((max(1, round(cim.width * k)), max(1, round(cim.height * k))), Image.LANCZOS))
+    h, w = crop.shape; side = int(max(h, w) * 1.1)
+    canvas = np.full((side, side), 255, np.uint8)
+    canvas[(side - h) // 2:(side - h) // 2 + h, (side - w) // 2:(side - w) // 2 + w] = crop.astype(np.uint8)
+    out = Image.fromarray(canvas).resize((512, 512), Image.LANCZOS)
+    dbg = img.copy()
+    for bx0, by0, bx1, by1 in boxes:
+        sl = (slice(max(0, int(by0)), int(by1) + 1), slice(max(0, int(bx0)), int(bx1) + 1))
+        dbg[sl] = (dbg[sl] * 0.5 + np.array([255, 120, 120]) * 0.5).astype(np.uint8)
+    return out, dbg, s, ((x0, y0, x1, y1) if framed else None), owords
+
+
+# ======================================================================= штамп -> данные
+CELLS = {   # ячейки формы 1 ГОСТ 2.104, мм от правого нижнего угла рамки: (слева, сверху, справа, снизу)
+    "designation": (120, 55, 0, 40), "name": (120, 40, 50, 15), "material": (120, 15, 50, 0),
+    "mass": (35, 35, 18, 20), "scale": (18, 35, 0, 20), "org": (50, 15, 0, 0),
+}
+LABELS = {"designation": "Обозначение", "name": "Наименование", "material": "Материал", "mass": "Масса, кг",
+          "scale": "Масштаб", "org": "Организация"}
+
+
+def cell_px(frame, s, cell):
+    x0, y0, x1, y1 = frame; l, t, r, b = CELLS[cell]
+    return x1 - l * s, y1 - t * s, x1 - r * s, y1 - b * s
+
+
+def text_layer_ok(words):
+    return bool(words) and sum(len(re.findall(r"[А-Яа-яЁё]", w[4])) for w in words) >= 10
+
+
+def stamp_from_pdf(words, frame, s):
+    res = {}
+    for k in CELLS:
+        l, t, r, b = cell_px(frame, s, k)
+        ws = [w for w in words if l <= (w[0] + w[2]) / 2 * PXMM <= r and t <= (w[1] + w[3]) / 2 * PXMM <= b]
+        res[k] = " ".join(w[4] for w in sorted(ws, key=lambda w: (round(w[1]), w[0])))
+    return res
+
+
+def stamp_from_ocr(gray, frame, s, up=4):
+    """OCR ячеек штампа. gray — лист в оттенках серого; up — во сколько раз увеличить ячейку перед OCR."""
+    if not shutil.which("tesseract"):
+        return {k: "" for k in CELLS}, "Tesseract не установлен — поля штампа не распознаны"
+    import subprocess, tempfile
+    res = {}
+    for k in CELLS:
+        l, t, r, b = cell_px(frame, s, k); p = max(1, int(0.6 * s))
+        c = gray[int(t) + p:int(b) - p, int(l) + p:int(r) - p]
+        if c.size == 0: res[k] = ""; continue
+        im = Image.fromarray(c.astype(np.uint8))
+        if up > 1: im = im.resize((im.width * up, im.height * up), Image.LANCZOS)
+        im = im.point(lambda v: 0 if v < 170 else 255)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            im.save(f.name)
+            r_ = subprocess.run(["tesseract", f.name, "-", "-l", "rus+eng", "--psm", "7"], capture_output=True, text=True)
+        txt = re.sub(r"\s+", " ", r_.stdout).strip(" |_—-")
+        if len(re.findall(r"[0-9A-Za-zА-Яа-яЁё]", txt)) < 3 and k not in ("mass", "scale"): txt = ""   # мусор пустой ячейки
+        if k == "mass": txt = re.sub(r"[^\d,\.]", "", txt)
+        res[k] = txt
+    return res, "OCR по изображению штампа — проверьте значения"
+
+
+DIM_RE = re.compile(r"(Ø|⌀|ø|R)?(\d+(?:[.,]\d+)?)(\*)?(?:[±+\-hHfFkKsSgGpPrR]\S*)?")
+
+
+def dims_from_tokens(tokens):
+    """Габариты: размеры со «*» (справочные), иначе три наибольших размера с поля видов."""
+    vals = []
+    for t in tokens:
+        mt = DIM_RE.fullmatch(t)
+        if mt and float(mt.group(2).replace(",", ".")) >= 5:
+            vals.append((float(mt.group(2).replace(",", ".")), (mt.group(1) or "").replace("⌀", "Ø").replace("ø", "Ø")
+                         + mt.group(2), bool(mt.group(3))))
+    star = [v for v in vals if v[2]]
+    pick = star if star else sorted(set(vals), reverse=True)[:3]
+    return ", ".join(v[1] for v in sorted(pick, reverse=True))
+
+
+def view_tokens_pdf(words, frame, s):
+    x0, y0, x1, y1 = frame
+    return [w[4] for w in words if x0 < w[0] * PXMM < x1 and y0 < w[1] * PXMM < y1 - 55 * s
+            and not (w[0] * PXMM > x1 - 190 * s and w[1] * PXMM > y1 - 120 * s and re.fullmatch(r"\d+\.", w[4]))]
+
+
+def to_float(s):
+    m = re.search(r"\d+(?:[.,]\d+)?", s or "")
+    return float(m.group().replace(",", ".")) if m else None
+
+
+def material_group(m):
+    m = (m or "").lower()
+    if "сч" in m or "вч" in m or "чугун" in m: return "чугун"
+    if re.search(r"\dх\d*н|х18|12х|нерж", m): return "нерж. сталь"
+    if "сталь" in m or "л " in m + " ": return "сталь"
+    return m.split(" ")[0] if m else ""
+
+
+# ======================================================================= модель и база
+class Finder:
+    def __init__(self, model_path, gallery_path, data_root, exclude_self=True):
+        self.exclude_self = exclude_self
+        ck = torch.load(model_path, map_location="cpu", weights_only=False)
+        self.name = ck["model"]; self.cfg = CFG[self.name]
+        self.net = Net(self.name, pretrained=False); self.net.use_proj = True
+        self.net.load_state_dict({k: v.float() if v.is_floating_point() else v for k, v in ck["state"].items()})
+        self.net.eval()
+        g = np.load(gallery_path, allow_pickle=True)
+        self.emb = g["emb"].astype(np.float32); self.files = [str(f) for f in g["files"]]
+        self.labels = g["labels"].astype(int); self.classes = [str(c) for c in g["classes"]]
+        self.root = Path(data_root)
+        p = pd.read_csv(self.root / "params.csv")
+        self.params = p.set_index("file_view")
+        # порог «нового класса»: 5-й перцентиль сходства каждого чертежа базы с ближайшим соседом
+        S = self.emb @ self.emb.T; np.fill_diagonal(S, -1)
+        self.thr = float(np.quantile(S.max(1), 0.05))
+        import torchvision.transforms as T
+        self.tf = T.Compose([T.Resize((self.cfg["size"], self.cfg["size"]), interpolation=T.InterpolationMode.BICUBIC,
+                                      antialias=True), T.Grayscale(3), T.ToTensor(), T.Normalize(*self.cfg["norm"])])
+
+    @torch.no_grad()
+    def embed(self, pil):
+        return self.net(self.tf(pil.convert("L")).unsqueeze(0))[0].numpy()
+
+    def search(self, e, meta, k=10):
+        sim = self.emb @ e
+        des = (meta.get("designation") or "").strip()
+        if des and self.exclude_self:   # тот же чертёж уже есть в базе — не считаем его аналогом самого себя
+            for j in np.where(self.params.reindex(self.files)["designation"].values == des)[0]: sim[j] = -1
+        idx = np.argsort(-sim)[:k]
+        votes = np.zeros(len(self.classes))
+        for j in idx[:5]: votes[self.labels[j]] += math.exp(sim[j] / 0.1)
+        cls = int(votes.argmax()); conf = float(votes[cls] / votes.sum())
+        m_mass, m_grp = to_float(meta.get("mass")), material_group(meta.get("material"))
+        rows = []
+        for j in idx:
+            f = self.files[j]; p = self.params.loc[f] if f in self.params.index else None
+            bonus = 0.0
+            if p is not None:
+                if m_grp and material_group(p["material"]) == m_grp: bonus += 0.5
+                if m_mass and p["mass_kg"] > 0: bonus += 0.5 * math.exp(-abs(math.log(m_mass / p["mass_kg"])))
+            rows.append(dict(j=int(j), sim=float(sim[j]), score=float(sim[j]) + 0.02 * bonus, file=f, p=p,
+                             cls=self.classes[self.labels[j]]))
+        rows.sort(key=lambda r: -r["score"])
+        return dict(cls=self.classes[cls], conf=conf, top1=float(sim[idx[0]]), new=float(sim[idx[0]]) < self.thr,
+                    analogs=rows[:5])
+
+
+# ======================================================================= отчёт
+CLS_RU = {"01": "Диски и фланцы", "02": "Колёса и шкивы", "03": "Втулки и стаканы", "04": "Валы и оси",
+          "05": "Корпусные", "06": "Петли и кронштейны", "07": "Рычаги и крюки", "08": "Плоские фасонные"}
+ru = lambda c: f"{CLS_RU.get(c[:2], c)} ({c[:2]})"
+
+
+def b64(img, maxw=None, fmt="PNG"):
+    im = img if isinstance(img, Image.Image) else Image.fromarray(img)
+    if maxw and im.width > maxw: im = im.resize((maxw, round(im.height * maxw / im.width)), Image.LANCZOS)
+    buf = io.BytesIO(); im.save(buf, fmt, optimize=True, **({"quality": 72} if fmt == "JPEG" else {}))
+    return f"data:image/{fmt.lower()};base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def card_html(r, root):
+    p = r["p"]; e = html.escape
+    img = b64(Image.open(root / r["file"]).convert("L"), 220)
+    rows = ""
+    if p is not None:
+        dims = f'{p["L"]:.0f} × {p["W"]:.0f} × {p["H"]:.0f}'
+        rows = (f"<tr><td>Обозначение</td><td>{e(str(p['designation']))}</td></tr>"
+                f"<tr><td>Наименование</td><td>{e(str(p['name']))}</td></tr>"
+                f"<tr><td>Материал</td><td>{e(str(p['material']))}</td></tr>"
+                f"<tr><td>Масса детали</td><td>{p['mass_kg']:.1f} кг</td></tr>"
+                f"<tr><td>Габариты</td><td>{dims} мм</td></tr>"
+                f"<tr class=s><td>Масса отливки (факт)*</td><td>{p['mass_casting_fact_SYNTH']:.1f} кг</td></tr>"
+                f"<tr class=s><td>Трудоёмкость (факт)*</td><td>{p['labor_hours_fact_SYNTH']:.0f} н·ч</td></tr>")
+    return (f'<div class=card><img src="{img}"><div class=sim>сходство {r["sim"]:.3f}</div>'
+            f'<div class=cls>{e(ru(r["cls"]))}</div><table>{rows}</table></div>')
+
+
+CSS = """
+/* лист отчёта: светло-серая «калька», синий чертёжный акцент, оранжевый — новый класс */
+:root{--bg:#f4f6f8;--fg:#1b2430;--mut:#5f6b78;--card:#fff;--line:#dde1e6;--acc:#1f5fbf;--ok:#1b7f3b;--warn:#b54708}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#14171c;--fg:#e6e8eb;--mut:#9aa3ad;--card:#1d2128;--line:#2e343d;--acc:#7aa7ff;--ok:#5cc98a;--warn:#f5a25d}}
+:root[data-theme=dark]{--bg:#14171c;--fg:#e6e8eb;--mut:#9aa3ad;--card:#1d2128;--line:#2e343d;--acc:#7aa7ff;--ok:#5cc98a;--warn:#f5a25d}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 'PT Sans',system-ui,-apple-system,'Segoe UI',sans-serif}
+h1,h2{text-wrap:balance;letter-spacing:.01em}
+.sim,td:last-child{font-family:'PT Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
+.top>div,.card{min-width:0}
+main{max-width:1180px;margin:0 auto;padding-block:24px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+h1{font-size:22px;margin:0 0 4px} h2{font-size:18px;margin:0}
+.lead{color:var(--mut);margin:0 0 20px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:0 0 22px}
+.top{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,.7fr) minmax(0,1fr);gap:16px;align-items:start;margin-top:12px}
+.top img{width:100%;border:1px solid var(--line);border-radius:6px;background:#fff}
+.cap{color:var(--mut);font-size:12px;margin-top:4px}
+table{border-collapse:collapse;width:100%;font-size:13px} td{padding:3px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+td:first-child{color:var(--mut);width:42%}
+.verdict{font-size:15px;padding:10px 12px;border-radius:8px;margin-bottom:10px;border:1px solid var(--line)}
+.verdict b{color:var(--ok)} .verdict.new b{color:var(--warn)}
+.cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-top:12px}
+.card{border:1px solid var(--line);border-radius:8px;padding:8px;font-size:12px}
+.card img{width:100%;background:#fff;border-radius:4px}
+.card table{font-size:11.5px} .sim{font-weight:600;margin-top:4px} .cls{color:var(--acc)}
+tr.s td{color:var(--mut);font-style:italic}
+.note{color:var(--mut);font-size:12px;margin-top:10px}
+@media (max-width:860px){.top{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inputs", nargs="+")
+    ap.add_argument("--model", default=None, help="Веса DINOv2 (best.pt)")
+    ap.add_argument("--gallery", default=None, help="База эмбеддингов (gallery.npz)")
+    ap.add_argument("--data", default=None, help="Папка с базой аналогов (params.csv)")
+    ap.add_argument("--yolo", default=None, help="Веса YOLO для структуры листа (по умолчанию eskd_yolo_best.pt)")
+    ap.add_argument("--no_yolo", action="store_true", help="Отключить YOLO и использовать эвристический разбор")
+    ap.add_argument("--out", default="report.html")
+    ap.add_argument("--debug_dir")
+    ap.add_argument("--intro", help="HTML-фрагмент (файл) для начала отчёта")
+    a = ap.parse_args()
+    t0 = time.time()
+
+    # Поиск и инициализация YOLO
+    yolo_model = None
+    if not a.no_yolo and HAS_YOLO:
+        candidates = [
+            a.yolo,
+            str(HERE / "eskd_yolo_best.pt"),
+            str(HERE.parent.parent / "eskd_yolo_best.pt"),
+            r"C:\Users\Yaroslav\runs\detect\runs\detect\eskd_yolo\weights\best.pt"
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                try:
+                    yolo_model = YOLO(c)
+                    print(f"[YOLO] Загружена модель детекции структуры листа: {c}")
+                    break
+                except Exception as e:
+                    print(f"[YOLO ВНИМАНИЕ] Не удалось загрузить {c}: {e}")
+
+    F = None
+    if a.model and a.gallery and a.data:
+        F = Finder(a.model, a.gallery, a.data)
+        print(f"модель {F.name}, база {len(F.files)} чертежей, порог нового класса {F.thr:.3f} ({time.time()-t0:.0f} c)")
+    else:
+        print("[ИНФО] Режим YOLO: извлечение структуры листа и штампа без kNN. Для поиска аналогов передайте --model, --gallery и --data.")
+    secs = []; e = html.escape
+    for path in a.inputs:
+        t1 = time.time(); path = Path(path)
+        img, words, sheet_mm = load_sheet(path)
+        tok = text_layer_ok(words); hi = None
+        if words is not None and not tok:   # PDF без читаемого текста (шрифты без кириллицы) — OCR по растру 300 dpi
+            import pymupdf
+            pg = pymupdf.open(str(path))[0]
+            pix = pg.get_pixmap(matrix=pymupdf.Matrix(DPI * 3 / 72, DPI * 3 / 72), alpha=False)
+            hi = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[..., :3].min(2)
+        yolo_res = None
+        cap_note = "Лист. Красным — исключено из анализа геометрии (штамп, доп. графа, ТТ)."
+        if yolo_model is not None:
+            try:
+                yolo_res = yolo_views_image(img, yolo_model, words=words, sheet_mm=sheet_mm)
+                if yolo_res is not None:
+                    views, dbg, s, frame, owords, cap_note = yolo_res
+            except Exception as e:
+                print(f"  [YOLO Ошибка {path.name}]: {e}, откат на эвристику")
+                yolo_res = None
+
+        if yolo_res is None:
+            views, dbg, s, frame, owords = views_image(img, words, sheet_mm, text_ok=tok,
+                                                       ocr_src=(hi, 3) if hi is not None else None)
+        if a.debug_dir:
+            Path(a.debug_dir).mkdir(parents=True, exist_ok=True); views.save(Path(a.debug_dir) / (path.stem + "_views.png"))
+        if frame and tok:
+            meta = stamp_from_pdf(words, frame, s); src = "текстовый слой PDF"
+            meta["dims"] = dims_from_tokens(view_tokens_pdf(words, frame, s))
+        elif frame:
+            if hi is not None:
+                meta, src = stamp_from_ocr(hi, tuple(v * 3 for v in frame), s * 3, up=1)
+                src = "OCR (в PDF нет читаемого текстового слоя) — проверьте значения"
+            else:
+                meta, src = stamp_from_ocr(img.min(2), frame, s)
+            x0, y0, x1, y1 = frame
+            meta["dims"] = dims_from_tokens([w[4] for w in (owords or []) if w[5] > 60 and x0 < w[0] < x1
+                                             and y0 < w[1] < y1 - 55 * s])
+        else:
+            meta, src = {k: "" for k in CELLS}, "рамка не найдена — данные штампа не извлечены"; meta["dims"] = ""
+        dt = time.time() - t1
+        trs = "".join(f"<tr><td>{LABELS[k]}</td><td>{e(meta.get(k) or '—')}</td></tr>" for k in LABELS)
+        trs += f"<tr><td>Габариты (по размерам)</td><td>{e(meta.get('dims') or '—')}</td></tr>"
+
+        cards_html = ""
+        if F is not None:
+            r = F.search(F.embed(views), meta)
+            print(f"{path.name}: {'НОВЫЙ КЛАСС' if r['new'] else r['cls']} conf={r['conf']:.2f} top1={r['top1']:.3f} "
+                  f"| {meta.get('designation','')} | {meta.get('name','')} | {meta.get('material','')} | {meta.get('mass','')} | {dt:.1f} c")
+            if r["new"]:
+                verdict = (f'<div class="verdict new"><b>Аналог не найден</b> — сходство с ближайшим {r["top1"]:.3f} '
+                           f'ниже порога {F.thr:.3f}. Предложить создать новый класс. Ближайшие чертежи ниже — для справки.</div>')
+            else:
+                verdict = (f'<div class=verdict>Класс: <b>{e(ru(r["cls"]))}</b> · уверенность {r["conf"]:.0%} · '
+                           f'сходство с ближайшим аналогом {r["top1"]:.3f} (порог {F.thr:.3f})</div>')
+            cards_html = f"<div class=cards>{''.join(card_html(x, F.root) for x in r['analogs'])}</div>"
+        else:
+            verdict = ('<div class=verdict>Структура листа: <b>РАСПОЗНАНА (YOLO)</b> · '
+                       'Поле видов и штамп успешно извлечены нейросетью.</div>')
+            print(f"{path.name}: [YOLO OK] {meta.get('designation','')} | {meta.get('name','')} | {meta.get('material','')} | {meta.get('mass','')} | {dt:.1f} c")
+
+        secs.append(f"""<section><h2>{e(path.name)}</h2>
+<div class=top>
+ <div><img src="{b64(dbg, 760, 'JPEG')}"><div class=cap>{e(cap_note)}</div></div>
+ <div><img src="{b64(views, 360)}"><div class=cap>Поле видов 512×512 (вход для DINOv2).</div></div>
+ <div>{verdict}<table>{trs}</table><div class=cap>Источник данных штампа: {e(src)}. Время обработки {dt:.1f} с.</div></div>
+</div>
+{cards_html}
+</section>""")
+    doc = f"""<!doctype html><html lang=ru><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Поиск аналогов отливок</title><meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=PT+Mono&family=PT+Sans:wght@400;700&display=swap"><style>{CSS}</style></head><body><main>
+<h1>Поиск аналогов по чертежу</h1>
+<p class=lead>{(f"Модель {F.name.upper()} (дообученная, ArcFace) · база {len(F.files)} чертежей, 8 классов · аналоги ранжируются по геометрии, материал и масса — вторичный признак.") if F is not None else "Анализ структуры листа ЕСКД выполнен через обученную нейросеть YOLOv8."}</p>
+{Path(a.intro).read_text(encoding="utf-8") if a.intro else ""}
+{''.join(secs)}
+<p class=note>* Фактические масса отливки и трудоёмкость в учебной базе синтетические (SYNTH) — показывают формат карточки аналога;
+в рабочей системе здесь будут фактические данные БВК. Геометрия базы — Mechanical Components Benchmark (Kim et al., ECCV 2020).</p>
+</main></body></html>"""
+    Path(a.out).write_text(doc, encoding="utf-8")
+    print(f"отчёт: {a.out}")
+
+
+if __name__ == "__main__":
+    main()

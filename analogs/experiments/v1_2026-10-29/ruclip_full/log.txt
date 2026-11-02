@@ -1,0 +1,19 @@
+=== ruclip / full | устройство cuda | train 1754 val 377 test 375
+[baseline] recall_at_1=0.7653  recall_at_5=0.9600  accuracy=0.7840  macro_f1=0.7420
+fine-tune: учим 51.2M параметров backbone, батч 16, эпох 15, шагов/эпоху 109
+эпоха  1  loss 11.864  val R@1 0.7745  val F1 0.7279  141 c
+эпоха  2  loss 9.575  val R@1 0.7454  val F1 0.7412  140 c
+эпоха  3  loss 9.045  val R@1 0.7692  val F1 0.7513  141 c
+эпоха  4  loss 8.954  val R@1 0.7507  val F1 0.7444  140 c
+эпоха  5  loss 8.465  val R@1 0.7533  val F1 0.7365  140 c
+эпоха  6  loss 8.459  val R@1 0.7586  val F1 0.7553  140 c
+эпоха  7  loss 8.273  val R@1 0.7745  val F1 0.7528  140 c
+эпоха  8  loss 8.332  val R@1 0.7666  val F1 0.7500  140 c
+эпоха  9  loss 7.701  val R@1 0.7586  val F1 0.7227  140 c
+эпоха 10  loss 7.776  val R@1 0.7692  val F1 0.7562  140 c
+эпоха 11  loss 7.704  val R@1 0.7586  val F1 0.7500  140 c
+эпоха 12  loss 7.936  val R@1 0.7560  val F1 0.7594  140 c
+ранняя остановка: 5 эпох без улучшения
+лучшая эпоха 7
+[finetuned] recall_at_1=0.7653  recall_at_5=0.9253  accuracy=0.7680  macro_f1=0.7308
+готово за 31.0 мин -> results/ruclip_full

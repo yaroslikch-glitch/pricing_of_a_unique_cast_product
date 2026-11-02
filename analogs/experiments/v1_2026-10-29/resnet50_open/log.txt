@@ -1,0 +1,21 @@
+=== resnet50 / open | устройство cuda | train 1592 val 342 test 341 | скрытый класс 06_petli_kronshteyny: val 35 test 34
+[baseline] recall_at_1=0.8094  recall_at_5=0.9413  accuracy=0.8211  macro_f1=0.7879  auroc_new_class=0.8795  threshold=0.9100  known_kept=0.9765  new_detected=0.1765
+fine-tune: учим 23.5M параметров backbone, батч 32, эпох 20, шагов/эпоху 49
+эпоха  1  loss 14.313  val R@1 0.6842  val F1 0.6662  37 c
+эпоха  2  loss 10.566  val R@1 0.7398  val F1 0.7002  36 c
+эпоха  3  loss 8.894  val R@1 0.7602  val F1 0.7506  36 c
+эпоха  4  loss 7.662  val R@1 0.7368  val F1 0.6803  36 c
+эпоха  5  loss 6.557  val R@1 0.7632  val F1 0.7296  36 c
+эпоха  6  loss 6.676  val R@1 0.7661  val F1 0.7373  36 c
+эпоха  7  loss 5.957  val R@1 0.7953  val F1 0.7557  36 c
+эпоха  8  loss 5.140  val R@1 0.7632  val F1 0.7429  36 c
+эпоха  9  loss 4.775  val R@1 0.7953  val F1 0.7748  36 c
+эпоха 10  loss 4.900  val R@1 0.7749  val F1 0.7191  36 c
+эпоха 11  loss 4.414  val R@1 0.7719  val F1 0.7647  36 c
+эпоха 12  loss 4.383  val R@1 0.7895  val F1 0.7619  36 c
+эпоха 13  loss 4.082  val R@1 0.7807  val F1 0.7583  36 c
+эпоха 14  loss 3.884  val R@1 0.7895  val F1 0.7609  36 c
+ранняя остановка: 5 эпох без улучшения
+лучшая эпоха 9
+[finetuned] recall_at_1=0.8123  recall_at_5=0.9238  accuracy=0.8065  macro_f1=0.7705  auroc_new_class=0.8520  threshold=0.8120  known_kept=0.9326  new_detected=0.4118
+готово за 9.2 мин -> results/resnet50_open

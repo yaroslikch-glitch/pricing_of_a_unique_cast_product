@@ -1,0 +1,31 @@
+﻿# данные и внешние тяжелые файлы
+out/
+mcb_raw/
+data/
+models/
+results/
+*.pth
+*.npz
+*.zip
+*.obj
+
+# базовые веса YOLO (скачиваются автоматически при первом запуске)
+yolov8n.pt
+
+# игнорировать веса по умолчанию, кроме обученных весов ESKD YOLO
+*.pt
+!eskd_yolo_best.pt
+!analogs/app/eskd_yolo_best.pt
+
+# окружение и кэш
+venv/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# временные тесты, отчеты и заметки Obsidian
+test_report*.html
+report.html
+test_extracted/
+проект/

@@ -1,0 +1,16 @@
+=== dinov2 / open | устройство cuda | train 1592 val 342 test 341 | скрытый класс 06_petli_kronshteyny: val 35 test 34
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[baseline] recall_at_1=0.8152  recall_at_5=0.9648  accuracy=0.8416  macro_f1=0.8042  auroc_new_class=0.9571  threshold=0.7663  known_kept=0.9619  new_detected=0.5882
+fine-tune: учим 43.0M параметров backbone, батч 16, эпох 15, шагов/эпоху 99
+/kaggle/working/train.py:305: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  scaler.step(opt); scaler.update(); sched.step(); tot += loss.item()
+эпоха  1  loss 10.239  val R@1 0.8333  val F1 0.8083  109 c
+эпоха  2  loss 8.009  val R@1 0.8246  val F1 0.8140  108 c
+эпоха  3  loss 7.137  val R@1 0.8129  val F1 0.8096  108 c
+эпоха  4  loss 6.964  val R@1 0.7924  val F1 0.7892  107 c
+эпоха  5  loss 6.198  val R@1 0.8099  val F1 0.8284  107 c
+эпоха  6  loss 5.108  val R@1 0.8216  val F1 0.7958  107 c
+ранняя остановка: 5 эпох без улучшения
+лучшая эпоха 1
+[finetuned] recall_at_1=0.8416  recall_at_5=0.9501  accuracy=0.8651  macro_f1=0.8363  auroc_new_class=0.9514  threshold=0.7679  known_kept=0.9736  new_detected=0.6765
+готово за 12.4 мин -> results/dinov2_open

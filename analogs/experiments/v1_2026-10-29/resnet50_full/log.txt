@@ -1,0 +1,25 @@
+=== resnet50 / full | устройство cuda | train 1754 val 377 test 375
+[baseline] recall_at_1=0.7840  recall_at_5=0.9253  accuracy=0.7813  macro_f1=0.7373
+fine-tune: учим 23.5M параметров backbone, батч 32, эпох 20, шагов/эпоху 54
+эпоха  1  loss 14.765  val R@1 0.6764  val F1 0.6576  44 c
+эпоха  2  loss 11.006  val R@1 0.6923  val F1 0.6440  43 c
+эпоха  3  loss 9.783  val R@1 0.7560  val F1 0.6936  43 c
+эпоха  4  loss 7.988  val R@1 0.7586  val F1 0.6961  43 c
+эпоха  5  loss 6.918  val R@1 0.7427  val F1 0.7239  43 c
+эпоха  6  loss 6.540  val R@1 0.7692  val F1 0.6987  43 c
+эпоха  7  loss 6.428  val R@1 0.7772  val F1 0.7369  43 c
+эпоха  8  loss 5.668  val R@1 0.7825  val F1 0.7518  43 c
+эпоха  9  loss 5.297  val R@1 0.7798  val F1 0.7586  43 c
+эпоха 10  loss 5.010  val R@1 0.7958  val F1 0.7815  43 c
+эпоха 11  loss 4.592  val R@1 0.7878  val F1 0.7751  42 c
+эпоха 12  loss 4.373  val R@1 0.7958  val F1 0.7992  43 c
+эпоха 13  loss 4.101  val R@1 0.8064  val F1 0.7959  43 c
+эпоха 14  loss 3.872  val R@1 0.7851  val F1 0.7752  42 c
+эпоха 15  loss 3.886  val R@1 0.8037  val F1 0.7848  42 c
+эпоха 16  loss 3.530  val R@1 0.7984  val F1 0.7675  40 c
+эпоха 17  loss 3.709  val R@1 0.7905  val F1 0.7855  39 c
+эпоха 18  loss 3.563  val R@1 0.8090  val F1 0.7773  40 c
+ранняя остановка: 5 эпох без улучшения
+лучшая эпоха 13
+[finetuned] recall_at_1=0.7707  recall_at_5=0.9013  accuracy=0.8027  macro_f1=0.7705
+готово за 13.6 мин -> results/resnet50_full
