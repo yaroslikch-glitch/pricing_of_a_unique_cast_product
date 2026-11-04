@@ -1,0 +1,26 @@
+description: Ultralytics eskd_YOLO_best model trained on dataset_yolo\dataset.yaml
+author: Ultralytics
+date: "2026-11-03T00:38:28.596114+05:00"
+version: "8.4.198"
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+head: Detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: views_field
+  1: view_front
+  2: view_top
+  3: view_left
+  4: stamp
+  5: tech_req
+  6: stamp_extra
+args:
+  batch: 1
+  quantize: null
+channels: 3
+end2end: false

@@ -1,0 +1,534 @@
+# -*- coding: utf-8 -*-
+"""
+Генератор расширенной базы выполненных заказов ООО «БВК» (ПГ КОНАР) и расчет DINOv2-эмбеддингов.
+Содержит 25 реальных типов литых заготовок нефтегазовой, энергетической и машиностроительной отраслей.
+"""
+
+import os
+import json
+import torch
+import torchvision.transforms as T
+import numpy as np
+from PIL import Image, ImageDraw
+
+def create_rich_catalog():
+    catalog = [
+        # Класс 05: Корпусные детали и арматура
+        {
+            "id": "BVK-05-104",
+            "name": "Корпус клапана высокого давления DN 200 PN 160",
+            "class_code": "05",
+            "class_name": "Корпусные детали и арматура",
+            "steel_grade": "20ГЛ",
+            "casting_group": "3а",
+            "mass_kg": 185.0,
+            "dimensions_mm": [450, 320, 280],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "РК", "МПД"],
+            "labor_hours_fact": 42.0,
+            "actual_cost_rub": 495000,
+            "has_pattern": True,
+            "pattern_cost_rub": 320000,
+            "category_tag": "Elbow_fitting",
+            "description": "Фасонная отливка корпуса клапана высокого давления для магистральных трубопроводов."
+        },
+        {
+            "id": "BVK-05-112",
+            "name": "Корпус задвижки клиновой DN 300 PN 40",
+            "class_code": "05",
+            "class_name": "Корпусные детали и арматура",
+            "steel_grade": "20ГЛ",
+            "casting_group": "3а",
+            "mass_kg": 310.0,
+            "dimensions_mm": [620, 480, 420],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "РК", "МПД", "ВИК"],
+            "labor_hours_fact": 58.0,
+            "actual_cost_rub": 680000,
+            "has_pattern": True,
+            "pattern_cost_rub": 410000,
+            "category_tag": "Standard_fitting",
+            "description": "Массивный литой корпус задвижки клиновой с фланцевыми патрубками для транспортировки нефти."
+        },
+        {
+            "id": "BVK-05-089",
+            "name": "Корпус редуктора привода насосной станции",
+            "class_code": "05",
+            "class_name": "Корпусные детали и арматура",
+            "steel_grade": "20Л",
+            "casting_group": "2",
+            "mass_kg": 240.0,
+            "dimensions_mm": [600, 480, 350],
+            "heat_treatment": "отжиг",
+            "ndt_methods": ["ВИК", "МПД"],
+            "labor_hours_fact": 36.0,
+            "actual_cost_rub": 560000,
+            "has_pattern": True,
+            "pattern_cost_rub": 350000,
+            "category_tag": "Helical_geared_motors",
+            "description": "Толстостенный корпус общемашиностроительного назначения с развитым оребрением."
+        },
+        {
+            "id": "BVK-05-067",
+            "name": "Корпус насоса спиральный центробежный",
+            "class_code": "05",
+            "class_name": "Корпусные детали и арматура",
+            "steel_grade": "12Х18Н12М3ТЛ",
+            "casting_group": "3а",
+            "mass_kg": 160.0,
+            "dimensions_mm": [520, 500, 240],
+            "heat_treatment": "аустенизация",
+            "ndt_methods": ["УЗК", "ЦД", "РК"],
+            "labor_hours_fact": 48.0,
+            "actual_cost_rub": 780000,
+            "has_pattern": False,
+            "pattern_cost_rub": 390000,
+            "category_tag": "Standard_fitting",
+            "description": "Коррозионностойкий корпус центробежного насоса для перекачки агрессивных пластовых сред."
+        },
+        {
+            "id": "BVK-05-045",
+            "name": "Крышка люка автоклава высокого давления",
+            "class_code": "05",
+            "class_name": "Корпусные детали и арматура",
+            "steel_grade": "20ГЛ",
+            "casting_group": "3",
+            "mass_kg": 98.0,
+            "dimensions_mm": [480, 480, 160],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "МПД"],
+            "labor_hours_fact": 22.0,
+            "actual_cost_rub": 410000,
+            "has_pattern": True,
+            "pattern_cost_rub": 220000,
+            "category_tag": "Plates_circulate_plates",
+            "description": "Сферическая крышка с фланцевым уплотнением под гребенчатую прокладку."
+        },
+
+        # Класс 01: Диски и фланцы
+        {
+            "id": "BVK-01-042",
+            "name": "Фланец переходной приварной DN 250",
+            "class_code": "01",
+            "class_name": "Диски и фланцы",
+            "steel_grade": "20ГЛ",
+            "casting_group": "3",
+            "mass_kg": 68.0,
+            "dimensions_mm": [380, 380, 110],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "ВИК"],
+            "labor_hours_fact": 14.0,
+            "actual_cost_rub": 345000,
+            "has_pattern": True,
+            "pattern_cost_rub": 160000,
+            "category_tag": "Flanged_block_bearing",
+            "description": "Фланцевое соединение для технологических трубопроводов высокого давления."
+        },
+        {
+            "id": "BVK-01-073",
+            "name": "Диск упорный паровой турбины",
+            "class_code": "01",
+            "class_name": "Диски и фланцы",
+            "steel_grade": "12Х18Н12М3ТЛ",
+            "casting_group": "3а",
+            "mass_kg": 95.0,
+            "dimensions_mm": [420, 420, 95],
+            "heat_treatment": "аустенизация",
+            "ndt_methods": ["УЗК", "ЦД"],
+            "labor_hours_fact": 28.0,
+            "actual_cost_rub": 620000,
+            "has_pattern": False,
+            "pattern_cost_rub": 240000,
+            "category_tag": "Plates_circulate_plates",
+            "description": "Нержавеющая высоколегированная отливка высокой термостойкости."
+        },
+        {
+            "id": "BVK-01-088",
+            "name": "Фланец воротниковый спецпрофиля DN 400",
+            "class_code": "01",
+            "class_name": "Диски и фланцы",
+            "steel_grade": "09Г2С",
+            "casting_group": "3",
+            "mass_kg": 112.0,
+            "dimensions_mm": [540, 540, 130],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "МПД"],
+            "labor_hours_fact": 20.0,
+            "actual_cost_rub": 435000,
+            "has_pattern": True,
+            "pattern_cost_rub": 210000,
+            "category_tag": "Flanged_plain_bearings",
+            "description": "Хладостойкий воротниковый фланец для эксплуатации в условиях Крайнего Севера (до -60°C)."
+        },
+        {
+            "id": "BVK-01-029",
+            "name": "Заглушка фланцевая быстросъемная",
+            "class_code": "01",
+            "class_name": "Диски и фланцы",
+            "steel_grade": "20Л",
+            "casting_group": "2",
+            "mass_kg": 42.0,
+            "dimensions_mm": [300, 300, 75],
+            "heat_treatment": "отжиг",
+            "ndt_methods": ["ВИК"],
+            "labor_hours_fact": 8.5,
+            "actual_cost_rub": 245000,
+            "has_pattern": True,
+            "pattern_cost_rub": 130000,
+            "category_tag": "Plates_circulate_plates",
+            "description": "Массивная глухая фланцевая крышка для испытательных стендов."
+        },
+
+        # Класс 02: Колёса и шкивы
+        {
+            "id": "BVK-02-019",
+            "name": "Шкив двухручьевой клиноременный",
+            "class_code": "02",
+            "class_name": "Колёса и шкивы",
+            "steel_grade": "25Л",
+            "casting_group": "2",
+            "mass_kg": 45.0,
+            "dimensions_mm": [320, 320, 140],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["ВИК"],
+            "labor_hours_fact": 11.0,
+            "actual_cost_rub": 290000,
+            "has_pattern": True,
+            "pattern_cost_rub": 170000,
+            "category_tag": "Pulleys",
+            "description": "Литой шкив с ободом переменного сечения и конической ступицей."
+        },
+        {
+            "id": "BVK-02-054",
+            "name": "Колесо рабочее центробежного насоса закрытого типа",
+            "class_code": "02",
+            "class_name": "Колёса и шкивы",
+            "steel_grade": "12Х18Н12М3ТЛ",
+            "casting_group": "3а",
+            "mass_kg": 72.0,
+            "dimensions_mm": [360, 360, 155],
+            "heat_treatment": "аустенизация",
+            "ndt_methods": ["УЗК", "ЦД", "РК"],
+            "labor_hours_fact": 34.0,
+            "actual_cost_rub": 590000,
+            "has_pattern": False,
+            "pattern_cost_rub": 310000,
+            "category_tag": "Fan",
+            "description": "Сложнопрофильное рабочее колесо с пространственными лопатками двоякой кривизны."
+        },
+        {
+            "id": "BVK-02-082",
+            "name": "Зубчатый венец тихоходной передачи",
+            "class_code": "02",
+            "class_name": "Колёса и шкивы",
+            "steel_grade": "40ХЛ",
+            "casting_group": "3",
+            "mass_kg": 135.0,
+            "dimensions_mm": [580, 580, 120],
+            "heat_treatment": "закалка_отпуск",
+            "ndt_methods": ["УЗК", "МПД"],
+            "labor_hours_fact": 26.0,
+            "actual_cost_rub": 510000,
+            "has_pattern": True,
+            "pattern_cost_rub": 260000,
+            "category_tag": "Right_spur_gears",
+            "description": "Высоконагруженный литой зубчатый венец для приводов дробильно-размольного оборудования."
+        },
+
+        # Класс 03: Втулки и стаканы
+        {
+            "id": "BVK-03-018",
+            "name": "Втулка направляющая скольжения",
+            "class_code": "03",
+            "class_name": "Втулки и стаканы",
+            "steel_grade": "20Л",
+            "casting_group": "2",
+            "mass_kg": 32.0,
+            "dimensions_mm": [180, 180, 260],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["ВИК"],
+            "labor_hours_fact": 9.5,
+            "actual_cost_rub": 235000,
+            "has_pattern": True,
+            "pattern_cost_rub": 120000,
+            "category_tag": "Bushes",
+            "description": "Тело вращения, центробежная отливка со свободной внутренней поверхностью."
+        },
+        {
+            "id": "BVK-03-055",
+            "name": "Стакан подшипникового узла тяжелого станка",
+            "class_code": "03",
+            "class_name": "Втулки и стаканы",
+            "steel_grade": "20ГЛ",
+            "casting_group": "3",
+            "mass_kg": 54.0,
+            "dimensions_mm": [240, 240, 190],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК"],
+            "labor_hours_fact": 12.0,
+            "actual_cost_rub": 315000,
+            "has_pattern": True,
+            "pattern_cost_rub": 150000,
+            "category_tag": "Socket",
+            "description": "Опора подшипника тяжелого прокатного стана с посадочным фланцем."
+        },
+        {
+            "id": "BVK-03-071",
+            "name": "Гильза цилиндра гидравлического пресса",
+            "class_code": "03",
+            "class_name": "Втулки и стаканы",
+            "steel_grade": "35Л",
+            "casting_group": "3",
+            "mass_kg": 145.0,
+            "dimensions_mm": [320, 320, 520],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "МПД"],
+            "labor_hours_fact": 29.0,
+            "actual_cost_rub": 480000,
+            "has_pattern": True,
+            "pattern_cost_rub": 250000,
+            "category_tag": "Bushes",
+            "description": "Толстостенная цилиндрическая отливка, рассчитанная на циклическое давление 25 МПа."
+        },
+
+        # Класс 04: Валы и оси
+        {
+            "id": "BVK-04-022",
+            "name": "Вал тихоходный ступенчатый редуктора",
+            "class_code": "04",
+            "class_name": "Валы и оси",
+            "steel_grade": "40ХЛ",
+            "casting_group": "3",
+            "mass_kg": 120.0,
+            "dimensions_mm": [780, 210, 210],
+            "heat_treatment": "закалка_отпуск",
+            "ndt_methods": ["УЗК", "МПД"],
+            "labor_hours_fact": 25.0,
+            "actual_cost_rub": 470000,
+            "has_pattern": False,
+            "pattern_cost_rub": 240000,
+            "category_tag": "Threaded_rods",
+            "description": "Литой заготовочный вал с утолщенными бочками под посадку шестерен."
+        },
+        {
+            "id": "BVK-04-035",
+            "name": "Ось балансира грузоподъемного механизма",
+            "class_code": "04",
+            "class_name": "Валы и оси",
+            "steel_grade": "20ГЛ",
+            "casting_group": "2",
+            "mass_kg": 85.0,
+            "dimensions_mm": [650, 160, 160],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК"],
+            "labor_hours_fact": 15.0,
+            "actual_cost_rub": 360000,
+            "has_pattern": True,
+            "pattern_cost_rub": 180000,
+            "category_tag": "Cylindrical_pins",
+            "description": "Массивная ось качания со смазочными каналами и буртами."
+        },
+
+        # Класс 06: Кронштейны, проушины и петли
+        {
+            "id": "BVK-06-031",
+            "name": "Кронштейн поворотный навески",
+            "class_code": "06",
+            "class_name": "Кронштейны, проушины и петли",
+            "steel_grade": "20ГЛ",
+            "casting_group": "3",
+            "mass_kg": 76.0,
+            "dimensions_mm": [310, 260, 180],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "МПД"],
+            "labor_hours_fact": 18.0,
+            "actual_cost_rub": 372000,
+            "has_pattern": True,
+            "pattern_cost_rub": 200000,
+            "category_tag": "Articulations_eyelets_and_other_articulated_joints",
+            "description": "Силовой кронштейн с ребрами жесткости и проушиной под палец гидроцилиндра."
+        },
+        {
+            "id": "BVK-06-015",
+            "name": "Проушина шарнирной опоры мостового крана",
+            "class_code": "06",
+            "class_name": "Кронштейны, проушины и петли",
+            "steel_grade": "20ХМЛ",
+            "casting_group": "3",
+            "mass_kg": 115.0,
+            "dimensions_mm": [380, 290, 210],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "МПД"],
+            "labor_hours_fact": 24.0,
+            "actual_cost_rub": 465000,
+            "has_pattern": False,
+            "pattern_cost_rub": 230000,
+            "category_tag": "Articulations_eyelets_and_other_articulated_joints",
+            "description": "Хладостойкая легированная отливка высокой динамической выносливости."
+        },
+        {
+            "id": "BVK-06-048",
+            "name": "Опора подвески магистрального газопровода",
+            "class_code": "06",
+            "class_name": "Кронштейны, проушины и петли",
+            "steel_grade": "09Г2С",
+            "casting_group": "3",
+            "mass_kg": 64.0,
+            "dimensions_mm": [280, 240, 190],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "ВИК"],
+            "labor_hours_fact": 13.5,
+            "actual_cost_rub": 330000,
+            "has_pattern": True,
+            "pattern_cost_rub": 160000,
+            "category_tag": "Clamps",
+            "description": "Климатическое исполнение ХЛ, эксплуатация в вечномерзлых грунтах."
+        },
+
+        # Класс 07: Рычаги, тяги и крюки
+        {
+            "id": "BVK-07-011",
+            "name": "Рычаг кривошипа привода запорной арматуры",
+            "class_code": "07",
+            "class_name": "Рычаги, тяги и крюки",
+            "steel_grade": "20ГЛ",
+            "casting_group": "3",
+            "mass_kg": 48.0,
+            "dimensions_mm": [420, 160, 95],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК"],
+            "labor_hours_fact": 11.5,
+            "actual_cost_rub": 298000,
+            "has_pattern": True,
+            "pattern_cost_rub": 140000,
+            "category_tag": "Lever",
+            "description": "Двуплечий рычаг с шлицевой ступицей и сферической головкой."
+        },
+        {
+            "id": "BVK-07-024",
+            "name": "Крюк грузовой чалочный г/п 15 тонн",
+            "class_code": "07",
+            "class_name": "Рычаги, тяги и крюки",
+            "steel_grade": "20ХМЛ",
+            "casting_group": "3а",
+            "mass_kg": 88.0,
+            "dimensions_mm": [520, 260, 140],
+            "heat_treatment": "закалка_отпуск",
+            "ndt_methods": ["УЗК", "РК", "МПД"],
+            "labor_hours_fact": 26.0,
+            "actual_cost_rub": 450000,
+            "has_pattern": True,
+            "pattern_cost_rub": 210000,
+            "category_tag": "Hook",
+            "description": "Ответственная отливка повышенной ударной вязкости (KCV >= 35 Дж/см2)."
+        },
+
+        # Класс 08: Фасонные и опорные плиты
+        {
+            "id": "BVK-08-012",
+            "name": "Плита опорная фундамента турбоагрегата",
+            "class_code": "08",
+            "class_name": "Фасонные и опорные плиты",
+            "steel_grade": "20Л",
+            "casting_group": "1",
+            "mass_kg": 380.0,
+            "dimensions_mm": [850, 600, 120],
+            "heat_treatment": "отжиг",
+            "ndt_methods": ["ВИК"],
+            "labor_hours_fact": 26.0,
+            "actual_cost_rub": 680000,
+            "has_pattern": True,
+            "pattern_cost_rub": 380000,
+            "category_tag": "Plates_circulate_plates",
+            "description": "Массивная опорная плита с Т-образными пазами под фундаментные болты."
+        },
+        {
+            "id": "BVK-08-033",
+            "name": "Траверса балансирная грузоподъемная",
+            "class_code": "08",
+            "class_name": "Фасонные и опорные плиты",
+            "steel_grade": "20ГЛ",
+            "casting_group": "2",
+            "mass_kg": 210.0,
+            "dimensions_mm": [720, 340, 180],
+            "heat_treatment": "нормализация_отпуск",
+            "ndt_methods": ["УЗК", "ВИК"],
+            "labor_hours_fact": 21.0,
+            "actual_cost_rub": 520000,
+            "has_pattern": False,
+            "pattern_cost_rub": 290000,
+            "category_tag": "Square",
+            "description": "Коробчатая фасонная траверса со строповочными отверстиями."
+        },
+        {
+            "id": "BVK-08-047",
+            "name": "Плита подмоторная компрессора",
+            "class_code": "08",
+            "class_name": "Фасонные и опорные плиты",
+            "steel_grade": "25Л",
+            "casting_group": "2",
+            "mass_kg": 165.0,
+            "dimensions_mm": [640, 420, 90],
+            "heat_treatment": "отжиг",
+            "ndt_methods": ["ВИК"],
+            "labor_hours_fact": 16.0,
+            "actual_cost_rub": 430000,
+            "has_pattern": True,
+            "pattern_cost_rub": 230000,
+            "category_tag": "Plates_circulate_plates",
+            "description": "Жесткая литая плита с развитыми ребрами против вибраций."
+        }
+    ]
+    return catalog
+
+def main():
+    catalog = create_rich_catalog()
+    with open("casting_catalog.json", "w", encoding="utf-8") as f:
+        json.dump(catalog, f, ensure_ascii=False, indent=2)
+    print(f"Сохранен расширенный каталог: {len(catalog)} позиций в casting_catalog.json")
+
+    # Вычисляем эталонные DINOv2 эмбеддинги для каждой позиции
+    print("Загрузка DINOv2 для вычисления визуальных признаков...")
+    dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+    dinov2.eval()
+
+    transform = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    train_files = os.listdir("dataset_yolo/images/train")
+    
+    embeddings = {}
+    for item in catalog:
+        tag = item.get("category_tag", "")
+        # Ищем соответствующий чертеж в датасете
+        matched_file = None
+        for fn in train_files:
+            if tag.lower() in fn.lower():
+                matched_file = fn
+                break
+        
+        if matched_file:
+            img_path = os.path.join("dataset_yolo/images/train", matched_file)
+            img = Image.open(img_path).convert("RGB")
+        else:
+            # Синтетический чертеж контура
+            img = Image.new("RGB", (224, 224), (255, 255, 255))
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([20, 20, 204, 204], outline=(0, 0, 0), width=3)
+            draw.text((30, 100), item["name"][:20], fill=(0, 0, 0))
+
+        t = transform(img).unsqueeze(0)
+        with torch.no_grad():
+            feat = dinov2(t).squeeze(0).numpy()
+        feat = feat / np.linalg.norm(feat)
+        embeddings[item["id"]] = feat
+        print(f"  [{item['id']}] {item['name'][:35]} -> embedding norm {np.linalg.norm(feat):.4f}")
+
+    np.savez_compressed("catalog_embeddings.npz", **embeddings)
+    print("Сохранено 25 эмбеддингов в catalog_embeddings.npz")
+
+if __name__ == "__main__":
+    main()

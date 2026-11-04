@@ -66,19 +66,32 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 `
 
-### 4. Запуск анализа чертежа (Инференс)
-`ash
-# Генерация интерактивного HTML-отчета по чертежу (PDF или PNG):
-python analogs/app/demo.py "path/to/drawing.pdf" --out report.html
+### 4. Запуск веб-сервиса ценообразования (Web UI)
+ash
+# Запуск интерактивного веб-сервиса (Gradio, Industrial Slate Theme):
+python web_app.py
+# Сервис доступен по адресу: http://127.0.0.1:7860
+# На Windows можно запустить батником: run_app.bat
 
-# Нарезка слоев чертежа в отдельные файлы через YOLO Extractor:
-python yolo_extractor.py "path/to/drawing.pdf" --output-dir layers_out/
-`
+### 5. Автономное тестирование (QA Bot)
+ash
+# Пакетная подача чертежей и генерация отчета bot_eval_results/eval_report.md:
+python batch_eval_bot.py --count 10
+# На Windows: run_batch_bot.bat
 
-### 5. Дообучение YOLO (при наличии GPU)
-`ash
-python train_yolo.py --data dataset_yolo/dataset.yaml --epochs 30 --imgsz 640 --device 0
-`
+### 6. Дообучение YOLO и генерация CAD-чертежей
+ash
+# Генерация параметрических 3D-моделей литья (.obj):
+python generate_cad_casting_models.py
+
+# Рендеринг чертежей ЕСКД из .obj с разметкой для YOLO:
+python generate_yolo_dataset.py --src models_cad_casting --out dataset_cad_drawings
+
+# Дообучение детектора ЕСКД:
+python train_yolo.py --data dataset_yolo/dataset.yaml --weights eskd_yolo_best.pt --epochs 10
+
+### 7. База знаний проекта в Obsidian
+Вся проектная документация, формулы калькуляции, архитектура RecSys CBR и регламенты собраны в папке проект/ (открывается напрямую через приложение Obsidian как Vault).
 
 ---
 

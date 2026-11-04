@@ -1,4 +1,4 @@
-﻿# PyTorch ставится отдельно командой с pytorch.org (CUDA-сборка для GPU или CPU-сборка для демо)
+# PyTorch ставится отдельно командой с pytorch.org (CUDA-сборка для GPU или CPU-сборка для демо)
 timm>=1.0.15
 huggingface_hub>=0.25
 pytorch-metric-learning>=2.5
@@ -11,6 +11,11 @@ tqdm
 matplotlib
 pymupdf>=1.24
 ultralytics>=8.0.0
+# веб-приложение, RecSys и генерация отчетов
+gradio>=4.0
+openpyxl>=3.1
+reportlab>=4.0
+
 # генерация датасета (data_gen)
 trimesh>=4.0
 embreex

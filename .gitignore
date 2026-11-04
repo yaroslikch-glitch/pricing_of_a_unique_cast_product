@@ -1,4 +1,4 @@
-﻿# данные и внешние тяжелые файлы
+# данные и внешние тяжелые файлы
 out/
 mcb_raw/
 data/
@@ -6,8 +6,16 @@ models/
 results/
 *.pth
 *.npz
+!catalog_embeddings.npz
 *.zip
 *.obj
+models_cad_casting/
+dataset_cad_drawings/
+dataset_yolo_trash_archive/
+manuals_input/
+exports/
+*.xlsx
+*.pdf
 
 # базовые веса YOLO (скачиваются автоматически при первом запуске)
 yolov8n.pt
@@ -23,9 +31,24 @@ venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+*.cache
 
-# временные тесты, отчеты и заметки Obsidian
+# временные тесты и отчеты
 test_report*.html
-report.html
+report*.html
 test_extracted/
-проект/
+test_vulkan_out/
+tests_output/
+weights_backup/
+bot_eval_results/
+runs/
+*.png
+!analogs/**
+!dataset_yolo/**
+dataset_yolo/**/*.cache
+dataset_yolo/labels/*.cache
+!mined_dataset/**
+
+# Obsidian vault (исключаем только локальное состояние окон)
+проект/.obsidian/workspace*.json
+

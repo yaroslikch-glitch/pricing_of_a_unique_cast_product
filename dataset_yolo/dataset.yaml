@@ -1,5 +1,5 @@
 # Конфигурация датасета для YOLO (ЕСКД анализ чертежей БВК / ЮУрГУ)
-path: C:/Users/Yaroslav/OneDrive/Desktop/diches/проект/dataset_yolo
+path: dataset_yolo
 train: images/train
 val: images/val
 

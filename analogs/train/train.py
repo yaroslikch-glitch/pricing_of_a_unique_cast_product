@@ -128,9 +128,10 @@ class DrawingSet(Dataset):
 @torch.no_grad()
 def embed(model, loader, dev):
     model.eval(); out = []
+    is_cuda = str(dev) == "cuda"
     for x, _ in loader:
-        with torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
-            out.append(model(x.to(dev, non_blocking=True)).float().cpu())
+        with torch.autocast("cuda", dtype=torch.float16, enabled=is_cuda):
+            out.append(model(x.to(dev, non_blocking=is_cuda)).float().cpu())
     return torch.cat(out).numpy()
 
 
@@ -219,7 +220,14 @@ def main():
 
     cfg = dict(CFG[a.model]); cfg["epochs"] = a.epochs or cfg["epochs"]; cfg["bs"] = a.bs or cfg["bs"]
     random.seed(0); np.random.seed(0); torch.manual_seed(0)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        dev = "cuda"
+    else:
+        try:
+            import torch_directml
+            dev = torch_directml.device()
+        except Exception:
+            dev = "cpu"
     root = Path(a.data)
     out = Path(a.out) / f"{a.model}_{a.run}"; out.mkdir(parents=True, exist_ok=True)
     log = open(out / "log.txt", "a", encoding="utf-8")
@@ -243,8 +251,9 @@ def main():
 
     S, N = cfg["size"], cfg["norm"]
     mk = lambda d, t: DrawingSet(root, d, S, N, t)
+    is_cuda = str(dev) == "cuda"
     dl = lambda ds, sh=False, sampler=None: DataLoader(ds, batch_size=cfg["bs"] * (1 if sampler else 2), shuffle=sh,
-                                                       sampler=sampler, num_workers=a.workers, pin_memory=dev == "cuda",
+                                                       sampler=sampler, num_workers=a.workers, pin_memory=is_cuda,
                                                        drop_last=sampler is not None, persistent_workers=a.workers > 0)
     ev = {k: dl(mk(d, False)) for k, d in dict(tr=tr, va=va, te=te, uva=unk_va, ute=unk_te).items() if len(d)}
 
@@ -288,15 +297,15 @@ def main():
         steps = cfg["epochs"] * len(trl); warm = len(trl)
         sched = torch.optim.lr_scheduler.LambdaLR(
             opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps))))
-        scaler = torch.amp.GradScaler("cuda", enabled=dev == "cuda")
+        scaler = torch.amp.GradScaler("cuda", enabled=is_cuda)
         say(f"fine-tune: учим {sum(p.numel() for p in bb) / 1e6:.1f}M параметров backbone, "
             f"батч {cfg['bs']}, эпох {cfg['epochs']}, шагов/эпоху {len(trl)}")
         best, best_ep, patience = -1, 0, 5
         for ep in range(1, cfg["epochs"] + 1):
             model.train(); te0 = time.time(); tot = 0
             for x, y in trl:
-                x, y = x.to(dev, non_blocking=True), y.to(dev)
-                with torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
+                x, y = x.to(dev, non_blocking=is_cuda), y.to(dev)
+                with torch.autocast("cuda", dtype=torch.float16, enabled=is_cuda):
                     f = model.proj(model.backbone(x).float())
                 loss = crit(f.float(), y)
                 opt.zero_grad(set_to_none=True)
