@@ -453,7 +453,7 @@ def main():
         return
 
     print(f"Найдено 3D-моделей: {len(all_objs)}")
-    random.seed(42)
+    random.seed(int(time.time()))
     random.shuffle(all_objs)
 
     total_to_gen = min(len(all_objs), args.count) if args.count else len(all_objs)
@@ -474,6 +474,7 @@ def main():
     os.makedirs(os.path.join(args.out, "preview_labels"), exist_ok=True)
 
     tasks = []
+    skipped = 0
     for idx, obj_p in enumerate(selected_objs):
         split = "val" if obj_p in val_set else "train"
         base = os.path.splitext(os.path.basename(obj_p))[0]
@@ -483,12 +484,18 @@ def main():
         img_p = os.path.join(args.out, "images", split, f"{sample_name}.png")
         txt_p = os.path.join(args.out, "labels", split, f"{sample_name}.txt")
 
+        if os.path.exists(img_p) and os.path.exists(txt_p):
+            skipped += 1
+            continue
+
         prev_p = None
         if idx < args.preview_count:
             prev_p = os.path.join(args.out, "preview_labels", f"{sample_name}_bboxes.png")
 
         tasks.append((obj_p, img_p, txt_p, prev_p, args.format))
 
+    if skipped > 0:
+        print(f"Пропущено существующих: {skipped}. Новых к генерации: {len(tasks)}")
     workers = args.workers or os.cpu_count() or 4
     print(f"Запуск генерации на {workers} ядрах CPU...")
 
