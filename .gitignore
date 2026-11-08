@@ -52,3 +52,7 @@ dataset_yolo/labels/*.cache
 # Obsidian vault (исключаем только локальное состояние окон)
 проект/.obsidian/workspace*.json
 
+
+dataset_yolo_expanded/images/
+dataset_yolo_expanded/labels/*.cache
+

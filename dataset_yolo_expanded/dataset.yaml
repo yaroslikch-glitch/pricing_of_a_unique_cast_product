@@ -1,0 +1,14 @@
+# Расширенный гибридный датасет ЕСКД (Синтетика + Завод БВК)
+# Всего чертежей: 1030 (Train: 875, Val: 155)
+path: dataset_yolo_expanded
+train: images/train
+val: images/val
+
+names:
+  0: views_field
+  1: view_front
+  2: view_top
+  3: view_left
+  4: stamp
+  5: tech_req
+  6: stamp_extra
