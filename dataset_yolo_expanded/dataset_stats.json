@@ -1,8 +1,8 @@
 {
   "base_yolo_copied": 1000,
   "factory_bvk_added": 30,
-  "synthetic_mcb_added": 0,
-  "train_count": 875,
-  "val_count": 155,
-  "total_count": 1030
+  "synthetic_mcb_added": 984,
+  "train_count": 1708,
+  "val_count": 306,
+  "total_count": 2014
 }
