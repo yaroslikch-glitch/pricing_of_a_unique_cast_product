@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Автономный AI-бот стресс-тестирования, оценки качества и аудита (Intelligent QA & Diagnostics Bot).
 Проект: Рекомендательный сервис оценки стоимости уникального литья (ЮУрГУ & ООО «БВК», ПГ КОНАР).
@@ -26,7 +26,7 @@ import web_app
 from cost_engine import FoundryCostEngine
 
 FACTORY_DRAWINGS_DIR = r"C:\Users\Yaroslav\OneDrive\Desktop\датасет проекта\датабаза\drawings"
-DEEPSEEK_PROXY_URL = "http://127.0.0.1:9655/v1/chat/completions"
+DEEPSEEK_PROXY_URL = os.environ.get("DEEPSEEK_API_URL", "http://78.17.76.203:9655/v1/chat/completions")
 
 
 class BatchEvalBot:

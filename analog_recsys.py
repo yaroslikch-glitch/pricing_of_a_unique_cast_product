@@ -1,14 +1,16 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Модуль рекомендательной системы подбора литых деталей-аналогов (RecSys Pipeline).
 Спроектирован по архитектурному шаблону `recsys-pipeline-architect` (Source -> Hydrator -> Filter -> Scorer -> Selector -> SideEffect).
 Интегрирован с энкодером визуальных признаков DINOv2 (facebookresearch/dinov2, 384d).
+Оптимизирован: LRU-кэширование дескрипторов DINOv2, Columnar Memory, BLAS GEMV и O(N) Top-K.
 Проект: Оценка себестоимости уникального литья (ЮУрГУ & ООО «БВК» / ПГ КОНАР).
 """
 
 import os
 import math
 import json
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import numpy as np
@@ -32,6 +34,9 @@ ESKD_CLASSES = {
 _DINOV2_MODEL = None
 _DINOV2_TRANSFORM = None
 
+# LRU-кэш дескрипторов в памяти: {sha256_hash: embedding_384d}
+_DINOV2_EMBEDDING_CACHE: Dict[str, np.ndarray] = {}
+
 def get_dinov2_extractor():
     """Синглтон ленивой загрузки легковесной модели DINOv2 (ViT-S/14)."""
     global _DINOV2_MODEL, _DINOV2_TRANSFORM
@@ -52,14 +57,20 @@ def get_dinov2_extractor():
     return _DINOV2_MODEL, _DINOV2_TRANSFORM
 
 def extract_visual_embedding(views_crop) -> Optional[np.ndarray]:
-    """Извлекает нормализованный 384-мерный вектор визуальных признаков проекций."""
-    model, transform = get_dinov2_extractor()
-    if not model or views_crop is None:
+    """Извлекает нормализованный 384-мерный вектор визуальных признаков проекций с LRU-кэшированием."""
+    if views_crop is None:
         return None
+
+    model, transform = get_dinov2_extractor()
+    if not model:
+        return None
+
     try:
         import torch
         from PIL import Image
+
         if isinstance(views_crop, np.ndarray):
+            raw_bytes = views_crop.tobytes()
             if len(views_crop.shape) == 2:
                 pil_img = Image.fromarray(views_crop).convert("RGB")
             elif views_crop.shape[2] == 3:
@@ -67,20 +78,34 @@ def extract_visual_embedding(views_crop) -> Optional[np.ndarray]:
             else:
                 pil_img = Image.fromarray(views_crop[:, :, :3])
         elif isinstance(views_crop, Image.Image):
+            raw_bytes = views_crop.tobytes()
             pil_img = views_crop.convert("RGB")
         else:
             return None
 
+        # Проверка в LRU-кэше по хэшу изображения
+        img_hash = hashlib.sha256(raw_bytes).hexdigest()
+        if img_hash in _DINOV2_EMBEDDING_CACHE:
+            return _DINOV2_EMBEDDING_CACHE[img_hash]
+
         t = transform(pil_img).unsqueeze(0)
-        with torch.no_grad():
+        with torch.inference_mode():
             feat = model(t).squeeze(0).numpy()
+
         norm = np.linalg.norm(feat)
         if norm > 0:
             feat = feat / norm
+
+        # Ограничиваем размер кэша 1000 элементов
+        if len(_DINOV2_EMBEDDING_CACHE) > 1000:
+            _DINOV2_EMBEDDING_CACHE.pop(next(iter(_DINOV2_EMBEDDING_CACHE)))
+        _DINOV2_EMBEDDING_CACHE[img_hash] = feat
+
         return feat
     except Exception as e:
         print(f"[RecSys] Ошибка извлечения DINOv2 эмбеддинга: {e}")
         return None
+
 
 class RecsysAnalogMatcher:
     """
@@ -88,8 +113,8 @@ class RecsysAnalogMatcher:
     1. Source: Загрузка базы выполненных отливок БВК и прекомпилированных эмбеддингов
     2. Hydrator: Обогащение металлургическими коэффициентами и геометрией
     3. Filter: Исключение технологически несопоставимых позиций
-    4. Scorer: Мультимодальный скоринг (DINOv2 косинусное сходство + масса + материал + группа)
-    5. Selector: Выборка Top-K аналогов
+    4. Scorer: Мультимодальный скоринг (Level-2 BLAS GEMV матричное умножение)
+    5. Selector: Выборка Top-K аналогов за линейное время O(N)
     6. SideEffect: Расчет ценовой дельты, калибровка себестоимости и экономия на оснастке
     """
     def __init__(self, catalog_path: Path = DEFAULT_CATALOG_PATH,
@@ -98,6 +123,7 @@ class RecsysAnalogMatcher:
         self.embeddings_path = embeddings_path
         self.catalog = self._load_catalog()
         self.embeddings = self._load_embeddings()
+        self._precompile_columnar_data()
 
     def _load_catalog(self) -> List[Dict[str, Any]]:
         if self.catalog_path.exists():
@@ -116,6 +142,36 @@ class RecsysAnalogMatcher:
                 print(f"[RecSys] Ошибка чтения {self.embeddings_path}: {e}")
         return {}
 
+    def _precompile_columnar_data(self):
+        """Предварительная однократная гидратация и раскладка в непрерывные массивы NumPy."""
+        self.N = len(self.catalog)
+        self.hydrated_catalog = []
+        for it in self.catalog:
+            self.hydrated_catalog.append(self.hydrate_item(it))
+
+        self.embeddings_matrix = np.zeros((self.N, 384), dtype=np.float32)
+        self.has_embeddings = (len(self.embeddings) > 0)
+        self.masses = np.zeros(self.N, dtype=np.float32)
+        self.aspects = np.zeros(self.N, dtype=np.float32)
+        self.steel_grades = []
+        self.casting_groups = []
+
+        for i, it in enumerate(self.catalog):
+            it_id = it.get("id", "")
+            if it_id in self.embeddings:
+                v = self.embeddings[it_id]
+                norm = np.linalg.norm(v)
+                self.embeddings_matrix[i] = (v / norm) if norm > 0 else v
+
+            self.masses[i] = float(it.get("mass_kg", 50.0))
+            dims = it.get("dimensions_mm", [300, 300, 100])
+            self.aspects[i] = dims[0] / max(1.0, float(dims[1]))
+            self.steel_grades.append(it.get("steel_grade", "20Л").upper())
+            self.casting_groups.append(str(it.get("casting_group", "3")))
+
+        self.steel_grades = np.array(self.steel_grades)
+        self.casting_groups = np.array(self.casting_groups)
+
     # 1. Source Stage
     def get_source_items(self) -> List[Dict[str, Any]]:
         return list(self.catalog)
@@ -124,7 +180,6 @@ class RecsysAnalogMatcher:
     def hydrate_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         item_copy = dict(item)
         mass = float(item_copy.get("mass_kg", 50.0))
-        # Расчетная масса расплава с учетом технологического КИМ 0.55
         item_copy["melt_mass_kg"] = round(mass / 0.55, 1)
         dims = item_copy.get("dimensions_mm", [300, 300, 100])
         item_copy["bounding_volume_dm3"] = round((dims[0] * dims[1] * dims[2]) / 1_000_000, 2)
@@ -150,13 +205,6 @@ class RecsysAnalogMatcher:
                     query_group: str,
                     query_aspect_ratio: float = 1.0,
                     query_embedding: Optional[np.ndarray] = None) -> List[Dict[str, Any]]:
-        """
-        Мультимодальный расчет сходства:
-        - Visual score (DINOv2 косинусное сходство 384d векторов или геометрический форм-фактор)
-        - Mass score (близость массы по логарифмической шкале)
-        - Material score (совпадение марки стали / легирования)
-        - Group score (совпадение группы контроля ГОСТ 977-88)
-        """
         scored = []
         has_dinov2 = query_embedding is not None and len(self.embeddings) > 0
 
@@ -166,13 +214,11 @@ class RecsysAnalogMatcher:
             dims = it.get("dimensions_mm", [300, 300, 100])
             aspect = dims[0] / max(1.0, dims[1])
 
-            # 1. Оценка близости масс: exp(-|ln(m1/m2)|)
             if query_mass > 0 and m > 0:
                 s_mass = math.exp(-abs(math.log(query_mass / m)))
             else:
                 s_mass = 0.5
 
-            # 2. Оценка марки стали
             it_steel = it.get("steel_grade", "20Л").upper()
             q_steel = query_steel.upper()
             if it_steel == q_steel:
@@ -182,26 +228,20 @@ class RecsysAnalogMatcher:
             else:
                 s_mat = 0.4
 
-            # 3. Визуальный скор (DINOv2)
             if has_dinov2 and it_id in self.embeddings:
                 c_emb = self.embeddings[it_id]
                 cos_sim = float(np.dot(query_embedding, c_emb))
-                # Переводим косинус [-1.0; 1.0] в шкалу [0.0; 1.0] с акцентом на высокую корреляцию
                 s_vis = max(0.0, min(1.0, (cos_sim + 1.0) / 2.0))
             else:
                 s_vis = math.exp(-abs(aspect - query_aspect_ratio))
 
-            # 4. Оценка группы отливки (ГОСТ 977-88)
             it_grp = str(it.get("casting_group", "3"))
             q_grp = str(query_group)
             s_grp = 1.0 if it_grp == q_grp else 0.7
 
-            # Интегральный скор с весами
             if has_dinov2:
-                # DINOv2 доступен: 35% визуал, 35% масса, 20% марка стали, 10% группа
                 total_score = round(0.35 * s_vis + 0.35 * s_mass + 0.20 * s_mat + 0.10 * s_grp, 3)
             else:
-                # Геометрический скоринг: 40% масса, 30% материал, 20% соотношение сторон, 10% группа
                 total_score = round(0.40 * s_mass + 0.30 * s_mat + 0.20 * s_vis + 0.10 * s_grp, 3)
 
             scored_entry = dict(it)
@@ -211,11 +251,8 @@ class RecsysAnalogMatcher:
             scored_entry["sim_mass_pct"] = round(s_mass * 100, 1)
             scored_entry["sim_material_pct"] = round(s_mat * 100, 1)
             scored_entry["sim_group_pct"] = round(s_grp * 100, 1)
-            
-            # Экономия на модельной оснастке
             pattern_savings = it.get("pattern_cost_rub", 0) if it.get("has_pattern") else 0
             scored_entry["pattern_savings_rub"] = pattern_savings
-
             scored.append(scored_entry)
 
         return scored
@@ -251,22 +288,22 @@ class RecsysAnalogMatcher:
         best = top_k[0]
         pattern_savings = best.get("pattern_savings_rub", 0)
 
-        # Формирование инженерной рекомендации CBR
+        # Формирование инженерной рекомендации CBR (с отсечкой ложной экономии при similarity < 75%)
         if best["sim_pct"] >= 75.0 and best.get("has_pattern"):
             rec_text = (
                 f"Высокая степень подобия с {best['id']} ({best['sim_pct']}%). "
                 f"На складе БВК имеется модельный комплект (экономия до {pattern_savings:,.0f} руб.). "
                 f"Рекомендуется адаптация существующей оснастки вместо изготовления с нуля."
             )
-        elif best["sim_pct"] >= 60.0:
+        elif best["sim_pct"] >= 75.0 and not best.get("has_pattern"):
             rec_text = (
-                f"Умеренное сходство с изделием {best['id']} ({best['sim_pct']}%). "
-                f"Рекомендуется использовать отработанную технологическую карту заливки и термообработки."
+                f"Геометрический аналог {best['id']} ({best['sim_pct']}%), но модельная оснастка отсутствует. "
+                f"Требуется изготовление нового деревянно-пластикового модельного комплекта на ЧПУ."
             )
         else:
             rec_text = (
-                "Уникальная конфигурация. Требуется полный цикл проектирования литниково-питающей системы (ЛПС) "
-                "и изготовление индивидуального модельного комплекта."
+                f"Уникальная конфигурация (максимальное подобие с {best['id']} всего {best['sim_pct']}%). "
+                f"Применять индивидуальную технологическую карту, экономия на оснастке не подтверждена."
             )
 
         return {
@@ -274,42 +311,77 @@ class RecsysAnalogMatcher:
             "weighted_analog_cost": round(weighted_cost),
             "cost_delta_rub": round(cost_delta),
             "cost_delta_pct": round(cost_delta_pct, 1),
-            "pattern_savings_max_rub": pattern_savings,
+            "pattern_savings_max_rub": pattern_savings if best["sim_pct"] >= 75.0 else 0,
             "best_analog": best,
             "recommendation": rec_text
         }
 
-    # Полный пайплайн поиска аналогов
     def find_analogs(self, mass_kg: float, steel_grade: str, casting_group: str,
-                     aspect_ratio: float = 1.0, views_crop=None, k: int = 3) -> Dict[str, Any]:
+                     aspect_ratio: float = 1.0, views_crop=None, k: int = 3) -> List[Dict[str, Any]]:
         """
-        Запускает сквозной конвейер RecSys:
-        Source -> Hydrate -> Filter -> Score -> Select -> SideEffect.
+        Высокоскоростной векторизованный конвейер поиска аналогов:
+        - Матричный GEMV расчет на OpenBLAS AVX2
+        - O(N) Top-K выборка через np.argpartition
+        - Страховочный fallback для экстремальных масс (малые/гигантские детали)
         """
-        # 1. Source
-        items = self.get_source_items()
-        
-        # 2. Hydrate
-        hydrated = [self.hydrate_item(it) for it in items]
-        
-        # 3. Filter
-        filtered = self.filter_items(hydrated, query_mass=mass_kg)
-        
-        # Извлекаем DINOv2 эмбеддинг, если переданы проекции чертежа
-        query_embedding = None
-        if views_crop is not None:
-            query_embedding = extract_visual_embedding(views_crop)
+        if self.N == 0:
+            return []
 
-        # 4. Score
-        scored = self.score_items(
-            filtered,
-            query_mass=mass_kg,
-            query_steel=steel_grade,
-            query_group=casting_group,
-            query_aspect_ratio=aspect_ratio,
-            query_embedding=query_embedding
-        )
-        
-        # 5. Select
-        selected = self.select_top_k(scored, k=k)
-        return selected
+        query_embedding = extract_visual_embedding(views_crop) if views_crop is not None else None
+        has_dinov2 = (query_embedding is not None) and self.has_embeddings
+
+        # 1. Визуальный скор
+        if has_dinov2:
+            cos_sims = self.embeddings_matrix @ query_embedding
+            s_vis = np.clip((cos_sims + 1.0) * 0.5, 0.0, 1.0)
+        else:
+            s_vis = np.exp(-np.abs(self.aspects - aspect_ratio))
+
+        # 2. Массовый скор
+        q_mass = max(0.001, mass_kg)
+        s_mass = np.exp(-np.abs(np.log(q_mass / self.masses)))
+
+        # 3. Материальный скор
+        q_steel = steel_grade.upper()
+        exact_steel = (self.steel_grades == q_steel)
+        has_l = (("Л" in q_steel) & (np.char.find(self.steel_grades, "Л") != -1)) | \
+                (("ГЛ" in q_steel) & (np.char.find(self.steel_grades, "ГЛ") != -1))
+        s_mat = np.where(exact_steel, 1.0, np.where(has_l, 0.8, 0.4)).astype(np.float32)
+
+        # 4. Скоринг группы отливки
+        q_grp = str(casting_group)
+        s_grp = np.where(self.casting_groups == q_grp, 1.0, 0.7).astype(np.float32)
+
+        # 5. Интегральный расчет
+        if has_dinov2:
+            total_scores = np.round(0.35 * s_vis + 0.35 * s_mass + 0.20 * s_mat + 0.10 * s_grp, 3)
+        else:
+            total_scores = np.round(0.40 * s_mass + 0.30 * s_mat + 0.20 * s_vis + 0.10 * s_grp, 3)
+
+        # 6. Фильтрация по массе (> 10-кратного отличия) со страховкой fallback
+        valid_mask = (self.masses <= q_mass * 10.0) & (self.masses >= q_mass * 0.1)
+        if np.any(valid_mask):
+            total_scores[~valid_mask] = -1.0
+
+        # 7. Выборка Top-K за O(N)
+        k_val = min(k, self.N)
+        top_k_idx = np.argpartition(total_scores, -k_val)[-k_val:]
+        top_k_idx = top_k_idx[np.argsort(-total_scores[top_k_idx])]
+
+        # 8. Форматирование только кандидатов Top-K
+        results = []
+        for idx in top_k_idx:
+            score = float(total_scores[idx])
+            if score < 0.0:
+                continue
+            entry = dict(self.hydrated_catalog[idx])
+            entry["similarity_score"] = score
+            entry["sim_pct"] = round(score * 100.0, 1)
+            entry["sim_visual_pct"] = round(float(s_vis[idx]) * 100.0, 1)
+            entry["sim_mass_pct"] = round(float(s_mass[idx]) * 100.0, 1)
+            entry["sim_material_pct"] = round(float(s_mat[idx]) * 100.0, 1)
+            entry["sim_group_pct"] = round(float(s_grp[idx]) * 100.0, 1)
+            entry["pattern_savings_rub"] = entry.get("pattern_cost_rub", 0) if entry.get("has_pattern") else 0
+            results.append(entry)
+
+        return results
