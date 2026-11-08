@@ -45,6 +45,7 @@ runs/
 *.png
 !analogs/**
 !dataset_yolo/**
+!dataset_yolo_expanded/**
 dataset_yolo/**/*.cache
 dataset_yolo/labels/*.cache
 !mined_dataset/**
@@ -53,6 +54,5 @@ dataset_yolo/labels/*.cache
 проект/.obsidian/workspace*.json
 
 
-dataset_yolo_expanded/images/
 dataset_yolo_expanded/labels/*.cache
 
